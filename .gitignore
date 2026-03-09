@@ -1,0 +1,5 @@
+inspector
+glimpse
+*.json
+!sample.json
+.claude/
