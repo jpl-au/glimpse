@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -13,36 +15,11 @@ const (
 	base64MinLength = 100
 )
 
-// humanizeFieldName converts a camelCase or PascalCase field name into
-// space-separated title case (e.g. "firstName" → "First Name").
-func humanizeFieldName(name string) string {
-	var result strings.Builder
-	for i, ch := range name {
-		if i > 0 && ch >= 'A' && ch <= 'Z' {
-			result.WriteRune(' ')
-		}
-		result.WriteRune(ch)
-	}
-	words := strings.Fields(result.String())
-	for i, w := range words {
-		if len(w) > 0 {
-			words[i] = strings.ToUpper(string(w[0])) + strings.ToLower(w[1:])
-		}
-	}
-	return strings.Join(words, " ")
-}
-
 // formatJSON renders a top-level JSON object as human-readable indented text.
 // Keys listed in imageFields are displayed as a placeholder instead of their
 // raw base64 value.
 func formatJSON(data map[string]any, imageFields map[string]bool) string {
-	var sb strings.Builder
-	for key, value := range data {
-		fmt.Fprintf(&sb, "━━ %s ━━\n", humanizeFieldName(key))
-		sb.WriteString(formatValue(value, 1, imageFields))
-		sb.WriteString("\n")
-	}
-	return sb.String()
+	return formatValue(data, 0, imageFields)
 }
 
 // formatValue recursively formats a JSON value as indented text. Values whose
@@ -53,15 +30,17 @@ func formatValue(value any, indent int, imageFields map[string]bool) string {
 	case map[string]any:
 		var sb strings.Builder
 		for k, val := range v {
-			hk := humanizeFieldName(k)
 			if imageFields[k] {
-				fmt.Fprintf(&sb, "%s%s: (base64 image data)\n", prefix, hk)
+				fmt.Fprintf(&sb, "%s%s: (base64 image data)\n", prefix, k)
 				continue
 			}
 			if val == nil || val == "" {
-				fmt.Fprintf(&sb, "%s%s: (empty)\n", prefix, hk)
+				fmt.Fprintf(&sb, "%s%s: (empty)\n", prefix, k)
+			} else if isCompound(val) {
+				fmt.Fprintf(&sb, "%s%s:\n%s", prefix, k,
+					formatValue(val, indent+1, imageFields))
 			} else {
-				fmt.Fprintf(&sb, "%s%s: %s\n", prefix, hk,
+				fmt.Fprintf(&sb, "%s%s: %s\n", prefix, k,
 					formatValue(val, indent+1, imageFields))
 			}
 		}
@@ -85,6 +64,45 @@ func formatValue(value any, indent int, imageFields map[string]bool) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// isCompound reports whether v is a map or slice (i.e. a value that formats
+// across multiple lines).
+func isCompound(v any) bool {
+	switch v.(type) {
+	case map[string]any, []any:
+		return true
+	}
+	return false
+}
+
+// applyFilter runs a gjson query against the raw JSON and formats the result.
+// An empty query returns the full formatted document.
+func applyFilter(raw []byte, query string, data map[string]any, imageFields map[string]bool) string {
+	if query == "" {
+		return formatJSON(data, imageFields)
+	}
+	result := gjson.GetBytes(raw, query)
+	if !result.Exists() {
+		return "  No results"
+	}
+	return formatResult(result, imageFields)
+}
+
+// formatResult formats a gjson query result as human-readable text.
+func formatResult(result gjson.Result, imageFields map[string]bool) string {
+	val := result.Value()
+	if val == nil {
+		return "  null"
+	}
+	if m, ok := val.(map[string]any); ok {
+		return formatJSON(m, imageFields)
+	}
+	s := formatValue(val, 0, imageFields)
+	if s == "" {
+		return "  (empty)"
+	}
+	return s
 }
 
 // isBase64 reports whether s is valid standard base64.
