@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
@@ -58,7 +57,7 @@ type model struct {
 	ready        bool
 }
 
-func initialModel(filename string, gfx graphics) (model, error) {
+func initialModel(name string, raw []byte, gfx graphics) (model, error) {
 	ti := textinput.New()
 	ti.Prompt = "Filter: "
 	ti.Placeholder = "search keys and values..."
@@ -74,15 +73,11 @@ func initialModel(filename string, gfx graphics) (model, error) {
 	ti.Focus()
 
 	m := model{
-		filename:    filename,
+		filename:    name,
 		filterInput: ti,
 		gfx:         gfx,
 	}
 
-	raw, err := os.ReadFile(filename)
-	if err != nil {
-		return m, fmt.Errorf("reading file: %w", err)
-	}
 	if err := json.Unmarshal(raw, &m.data); err != nil {
 		return m, fmt.Errorf("parsing JSON: %w", err)
 	}

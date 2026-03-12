@@ -21,6 +21,14 @@ go install github.com/jpl-au/glimpse@latest
 glimpse <json-file>
 ```
 
+Glimpse also reads from stdin, so you can pipe JSON from any source:
+
+```sh
+cat data.json | glimpse -
+psql -t -c "SELECT data FROM docs WHERE id = 42" mydb | glimpse -
+curl -s https://api.example.com/data | glimpse -
+```
+
 ## Controls
 
 | Key        | Action                                  |
