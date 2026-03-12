@@ -1,5 +1,6 @@
 inspector
 glimpse
+*.exe
 *.json
 !sample.json
 .claude/
