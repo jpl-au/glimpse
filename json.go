@@ -1,66 +1,62 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
+	"sort"
 	"strings"
-
-	"github.com/tidwall/gjson"
 )
 
 const (
-	// base64MinLength is the minimum string length before we consider it
-	// a possible base64-encoded image. Short strings are not worth the
-	// cost of a trial decode.
-	base64MinLength = 100
+	// base64MinLength filters out short strings that are almost certainly
+	// normal text rather than encoded image data.
+	base64MinLength = 16
 )
 
 // formatJSON renders a top-level JSON object as human-readable indented text.
-// Keys listed in imageFields are displayed as a placeholder instead of their
-// raw base64 value.
-func formatJSON(data map[string]any, imageFields map[string]bool) string {
-	return formatValue(data, 0, imageFields)
+// String values that look like base64 image data are replaced with a
+// placeholder.
+func formatJSON(data map[string]any) string {
+	return formatValue(data, 0)
 }
 
-// formatValue recursively formats a JSON value as indented text. Values whose
-// keys appear in imageFields are rendered as a placeholder.
-func formatValue(value any, indent int, imageFields map[string]bool) string {
+// formatValue recursively formats a JSON value as indented text.
+func formatValue(value any, indent int) string {
 	prefix := strings.Repeat("  ", indent)
 	switch v := value.(type) {
 	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
 		var sb strings.Builder
-		for k, val := range v {
-			if imageFields[k] {
-				fmt.Fprintf(&sb, "%s%s: (base64 image data)\n", prefix, k)
-				continue
-			}
-			if val == nil || val == "" {
-				fmt.Fprintf(&sb, "%s%s: (empty)\n", prefix, k)
+		for _, k := range keys {
+			val := v[k]
+			if val == nil {
+				fmt.Fprintf(&sb, "%s%s: null\n", prefix, k)
+			} else if s, ok := val.(string); ok && s == "" {
+				fmt.Fprintf(&sb, "%s%s: \"\"\n", prefix, k)
 			} else if isCompound(val) {
-				fmt.Fprintf(&sb, "%s%s:\n%s", prefix, k,
-					formatValue(val, indent+1, imageFields))
+				fmt.Fprintf(&sb, "%s%s:\n%s", prefix, k, formatValue(val, indent+1))
 			} else {
-				fmt.Fprintf(&sb, "%s%s: %s\n", prefix, k,
-					formatValue(val, indent+1, imageFields))
+				fmt.Fprintf(&sb, "%s%s: %s\n", prefix, k, formatValue(val, indent+1))
 			}
 		}
 		return sb.String()
 	case []any:
 		var sb strings.Builder
 		for i, val := range v {
-			fmt.Fprintf(&sb, "%s[%d]: %s\n", prefix, i, formatValue(val, indent+1, imageFields))
+			fmt.Fprintf(&sb, "%s[%d]: %s\n", prefix, i, formatValue(val, indent+1))
 		}
 		return sb.String()
 	case string:
 		if v == "" {
-			return "(empty)"
+			return `""`
 		}
 		return v
 	case float64:
-		if v == float64(int64(v)) {
-			return fmt.Sprintf("%.0f", v)
-		}
-		return fmt.Sprintf("%.2f", v)
+		return fmt.Sprintf("%g", v)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
@@ -76,39 +72,74 @@ func isCompound(v any) bool {
 	return false
 }
 
-// applyFilter runs a gjson query against the raw JSON and formats the result.
-// An empty query returns the full formatted document.
-func applyFilter(raw []byte, query string, data map[string]any, imageFields map[string]bool) string {
+// applyFilter performs a case-insensitive text search across keys and
+// values, returning the formatted result. An empty query returns the
+// full document.
+func applyFilter(query string, data map[string]any) string {
 	if query == "" {
-		return formatJSON(data, imageFields)
+		return formatJSON(data)
 	}
-	result := gjson.GetBytes(raw, query)
-	if !result.Exists() {
+	needle := strings.ToLower(query)
+	matched := filterMap(data, needle)
+	if len(matched) == 0 {
 		return "  No results"
 	}
-	return formatResult(result, imageFields)
+	return formatJSON(matched)
 }
 
-// formatResult formats a gjson query result as human-readable text.
-func formatResult(result gjson.Result, imageFields map[string]bool) string {
-	val := result.Value()
-	if val == nil {
-		return "  null"
+// filterMap returns entries from data where the key or any string value
+// (recursively) contains needle (case-insensitive).
+func filterMap(data map[string]any, needle string) map[string]any {
+	result := make(map[string]any)
+	for k, v := range data {
+		if matchesValue(k, v, needle) {
+			result[k] = v
+		}
 	}
-	if m, ok := val.(map[string]any); ok {
-		return formatJSON(m, imageFields)
-	}
-	s := formatValue(val, 0, imageFields)
-	if s == "" {
-		return "  (empty)"
-	}
-	return s
+	return result
 }
 
-// isBase64 reports whether s is valid standard base64.
+// matchesValue reports whether a key or its value tree contains needle.
+func matchesValue(key string, value any, needle string) bool {
+	if strings.Contains(strings.ToLower(key), needle) {
+		return true
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(strings.ToLower(v), needle)
+	case float64:
+		return strings.Contains(fmt.Sprintf("%g", v), needle)
+	case bool:
+		return strings.Contains(fmt.Sprintf("%v", v), needle)
+	case map[string]any:
+		for k, v := range v {
+			if matchesValue(k, v, needle) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if matchesValue("", item, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isBase64 reports whether s looks like valid standard base64. It performs
+// a fast, allocation-free character check rather than decoding the full
+// string — actual decoding happens later in decodeImage.
 func isBase64(s string) bool {
-	_, err := base64.StdEncoding.DecodeString(s)
-	return err == nil
+	if len(s)%4 != 0 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '+' && r != '/' && r != '=' {
+			return false
+		}
+	}
+	return true
 }
 
 // isImageString reports whether s looks like base64-encoded image data,

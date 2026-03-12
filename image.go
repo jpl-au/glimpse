@@ -8,6 +8,8 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi/sixel"
@@ -18,49 +20,81 @@ import (
 )
 
 const (
-	// cellPixelWidth is the assumed pixel width of one terminal character
-	// cell, used when sizing images for kitty/sixel protocol output.
+	// cellPixelWidth assumes 8px per cell, matching the typical VT100 cell
+	// geometry used by kitty and sixel renderers.
 	cellPixelWidth = 8
 
-	// cellPixelHeight is the assumed pixel height of one terminal character
-	// cell.
+	// cellPixelHeight assumes 16px per cell (2:1 height-to-width ratio),
+	// matching most monospaced terminal fonts.
 	cellPixelHeight = 16
 
-	// pixelsPerRow is the number of vertical image pixels encoded per
-	// character row when rendering with half-block characters.
+	// pixelsPerRow is 2 because half-block characters (U+2580 "▀") encode
+	// two vertical pixels per terminal row via foreground/background colours.
 	pixelsPerRow = 2
 )
 
-// findImageData recursively searches a JSON value for the first string that
-// looks like base64-encoded image data. It records matching keys in
-// imageFields so that formatValue can show a placeholder without re-decoding.
-func findImageData(data any, imageFields map[string]bool) string {
+// imagePlaceholder replaces base64 image data in the parsed JSON tree so
+// that formatting and search operate on clean, human-readable values.
+const imagePlaceholder = "(base64 image data)"
+
+// imageEntry holds a decoded image and its JSON key name.
+type imageEntry struct {
+	key string
+	img image.Image
+}
+
+// findImages walks data, decoding any base64 image strings it finds.
+// Matched values are replaced in-place with imagePlaceholder so that
+// subsequent formatting and searching skip them automatically. Map keys
+// are visited in sorted order for deterministic results.
+func findImages(data any) []imageEntry {
+	var entries []imageEntry
+	collectImages(data, "", &entries)
+	return entries
+}
+
+func collectImages(data any, key string, entries *[]imageEntry) {
 	switch v := data.(type) {
 	case map[string]any:
-		for key, value := range v {
-			lk := strings.ToLower(key)
-			if strings.Contains(lk, "image") || strings.Contains(lk, "photo") || strings.Contains(lk, "picture") {
-				if str, ok := value.(string); ok && isImageString(str) {
-					imageFields[key] = true
-					return str
-				}
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			s, ok := v[k].(string)
+			if !ok || !isImageString(s) {
+				collectImages(v[k], k, entries)
+				continue
 			}
-			if result := findImageData(value, imageFields); result != "" {
-				return result
+			v[k] = imagePlaceholder
+			img, err := decodeImage(s)
+			if err != nil {
+				slog.Warn("skipping image", "key", k, "err", err)
+				continue
 			}
+			*entries = append(*entries, imageEntry{key: k, img: img})
 		}
 	case []any:
-		for _, item := range v {
-			if result := findImageData(item, imageFields); result != "" {
-				return result
+		for i, item := range v {
+			s, ok := item.(string)
+			if !ok || !isImageString(s) {
+				collectImages(item, key, entries)
+				continue
 			}
-		}
-	case string:
-		if isImageString(v) {
-			return v
+			v[i] = imagePlaceholder
+			img, err := decodeImage(s)
+			if err != nil {
+				slog.Warn("skipping image", "key", key, "err", err)
+				continue
+			}
+			name := key
+			if name == "" {
+				name = "image"
+			}
+			*entries = append(*entries, imageEntry{key: name, img: img})
 		}
 	}
-	return ""
 }
 
 // decodeImage decodes a base64-encoded image string (with or without a
@@ -100,26 +134,30 @@ func renderPreview(img image.Image, cols, rows int) string {
 	fitH := float64(rows) * pixelsPerRow
 
 	scale := min(fitW/imgW, fitH/imgH)
-	drawW := int(imgW * scale)
-	drawPxH := int(imgH * scale)
-	drawPxH += drawPxH & 1 // round up to even for half-block pairs
+	w := int(imgW * scale)
+	h := int(imgH * scale)
 
-	if drawW < 1 {
-		drawW = 1
-	}
-	if drawPxH < pixelsPerRow {
-		drawPxH = pixelsPerRow
+	// Round up to even so half-block pairs align.
+	if h%2 != 0 {
+		h++
 	}
 
-	resized := resizeImage(img, drawW, drawPxH)
+	if w < 1 {
+		w = 1
+	}
+	if h < pixelsPerRow {
+		h = pixelsPerRow
+	}
 
-	padLeft := (cols - drawW) / 2
+	resized := resizeImage(img, w, h)
+
+	padLeft := (cols - w) / 2
 	pad := strings.Repeat(" ", padLeft)
 
 	var sb strings.Builder
-	for y := 0; y < drawPxH; y += pixelsPerRow {
+	for y := 0; y < h; y += pixelsPerRow {
 		sb.WriteString(pad)
-		for x := 0; x < drawW; x++ {
+		for x := 0; x < w; x++ {
 			tr, tg, tb, _ := resized.At(x, y).RGBA()
 			br, bg, bb, _ := resized.At(x, y+1).RGBA()
 			fmt.Fprintf(&sb, "\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀",
@@ -133,7 +171,7 @@ func renderPreview(img image.Image, cols, rows int) string {
 // renderFullscreen renders an image at high quality using the best available
 // terminal graphics protocol (kitty or sixel). It scales the image to fill the
 // given terminal dimensions while preserving aspect ratio.
-func renderFullscreen(img image.Image, termCols, termRows int) string {
+func renderFullscreen(img image.Image, termCols, termRows int, gfx graphics) string {
 	pxWidth := termCols * cellPixelWidth
 	pxHeight := termRows * cellPixelHeight
 
@@ -145,21 +183,30 @@ func renderFullscreen(img image.Image, termCols, termRows int) string {
 
 	var buf bytes.Buffer
 
-	if supportsKittyGraphics() {
-		if err := kittyimg.Fprint(&buf, resized); err == nil {
+	if gfx.kitty {
+		if err := kittyimg.Fprint(&buf, resized); err != nil {
+			slog.Debug("kitty encode failed, falling back", "err", err)
+		} else {
 			return buf.String()
 		}
 	}
 
-	if supportsSixelGraphics() {
+	if gfx.sixel {
+		buf.Reset()
 		buf.WriteString("\x1bPq")
-		if err := new(sixel.Encoder).Encode(&buf, resized); err == nil {
+		if err := new(sixel.Encoder).Encode(&buf, resized); err != nil {
+			slog.Debug("sixel encode failed, falling back", "err", err)
+		} else {
 			buf.WriteString("\x1b\\")
 			return buf.String()
 		}
 	}
 
-	return "No supported image protocol detected.\nRequires: Kitty, Ghostty, WezTerm, iTerm2, or foot"
+	// No HD graphics protocol available — fall back to half-block rendering
+	// with a notice so the user understands the degradation.
+	notice := "  No HD graphics protocol detected — showing standard preview\n" +
+		"  (install Kitty, Ghostty, WezTerm, iTerm2, or foot for HD)\n\n"
+	return notice + renderPreview(resized, termCols, termRows-3)
 }
 
 // resizeImage scales img to the given dimensions using Catmull-Rom

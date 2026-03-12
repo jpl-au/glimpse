@@ -2,8 +2,8 @@
 //
 // It renders a split-view TUI using Bubble Tea and Lip Gloss, showing
 // formatted JSON on the left and an embedded image preview on the right.
-// Press 'i' for a full-screen high-quality image view using kitty or sixel
-// graphics protocols.
+// Press ctrl+p for a full-screen high-quality image view using kitty or
+// sixel graphics protocols.
 //
 // Usage:
 //
@@ -22,7 +22,9 @@ func main() {
 		log.Fatal("Usage: glimpse <json-file>")
 	}
 
-	m, err := initialModel(os.Args[1])
+	gfx := detectGraphics()
+
+	m, err := initialModel(os.Args[1], gfx)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}

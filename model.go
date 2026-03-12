@@ -3,10 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"image"
-	"log"
 	"os"
-	"strings"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
@@ -16,10 +13,16 @@ import (
 )
 
 const (
-	// borderPadding is the horizontal space consumed by each pane's rounded
-	// border and internal padding. Subtracted from half the terminal width
-	// to get the usable content width per pane.
+	// borderPadding accounts for the gap needed so that two panes placed
+	// side-by-side don't exceed the terminal width. Each pane's lipgloss
+	// Width is border-box, so the rendered width equals the Width value.
 	borderPadding = 3
+
+	// paneFrame is the horizontal space consumed by the rounded border
+	// (1 left + 1 right) and padding (1 left + 1 right) inside each pane.
+	// Content (viewports, filter) must be sized to (paneWidth - paneFrame)
+	// so that lipgloss does not word-wrap and inflate the line count.
+	paneFrame = 4
 
 	// chromeHeight is the vertical space consumed by the title bar, status
 	// bar, and border chrome.
@@ -28,9 +31,6 @@ const (
 	// filterHeight is the vertical space consumed by the filter input
 	// inside the left pane.
 	filterHeight = 1
-
-	// paneCount is the number of panes for tab cycling.
-	paneCount = 2
 )
 
 type viewMode int
@@ -42,31 +42,26 @@ const (
 
 type model struct {
 	data         map[string]any
-	rawJSON      []byte
 	filename     string
 	jsonContent  string
-	hasImage     bool
-	img          image.Image
-	hqImageCache string
+	images       []imageEntry
+	imageIdx     int
+	hdImageCache string
 	filterInput  textinput.Model
 	jsonPane     viewport.Model
 	imagePane    viewport.Model
+	gfx          graphics
 	width        int
 	height       int
 	mode         viewMode
 	activePane   int
 	ready        bool
-
-	// imageFields tracks JSON keys whose values are base64-encoded image
-	// data. Populated during load so that formatValue can display a
-	// placeholder without re-decoding.
-	imageFields map[string]bool
 }
 
-func initialModel(filename string) (model, error) {
+func initialModel(filename string, gfx graphics) (model, error) {
 	ti := textinput.New()
 	ti.Prompt = "Filter: "
-	ti.Placeholder = "gjson path (e.g. users.#.name)"
+	ti.Placeholder = "search keys and values..."
 	// Unbind keys that conflict with pane switching and viewport scrolling.
 	ti.KeyMap.AcceptSuggestion = key.NewBinding(key.WithDisabled())
 	ti.KeyMap.NextSuggestion = key.NewBinding(key.WithDisabled())
@@ -81,30 +76,19 @@ func initialModel(filename string) (model, error) {
 	m := model{
 		filename:    filename,
 		filterInput: ti,
-		imageFields: make(map[string]bool),
+		gfx:         gfx,
 	}
 
 	raw, err := os.ReadFile(filename)
 	if err != nil {
 		return m, fmt.Errorf("reading file: %w", err)
 	}
-	m.rawJSON = raw
-
 	if err := json.Unmarshal(raw, &m.data); err != nil {
 		return m, fmt.Errorf("parsing JSON: %w", err)
 	}
 
-	m.jsonContent = formatJSON(m.data, m.imageFields)
-
-	if imgData := findImageData(m.data, m.imageFields); imgData != "" {
-		img, err := decodeImage(imgData)
-		if err != nil {
-			log.Printf("warning: found image data but failed to decode: %v", err)
-		} else {
-			m.img = img
-			m.hasImage = true
-		}
-	}
+	m.jsonContent = formatJSON(m.data)
+	m.images = findImages(m.data)
 
 	return m, nil
 }
@@ -124,40 +108,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-		halfWidth := m.width/2 - borderPadding
-		contentHeight := m.height - chromeHeight
-		jsonHeight := contentHeight - filterHeight
+		innerWidth := m.width/2 - borderPadding - paneFrame
+		// Both panes share the same viewport height: total height minus
+		// chrome (title + status + borders) minus the one-line header
+		// each pane uses (filter bar / image selector).
+		vpHeight := m.height - chromeHeight - filterHeight
 
-		m.filterInput.SetWidth(halfWidth)
+		m.filterInput.SetWidth(innerWidth)
 
 		if !m.ready {
 			m.jsonPane = viewport.New()
-			m.jsonPane.SetWidth(halfWidth)
-			m.jsonPane.SetHeight(jsonHeight)
+			m.jsonPane.SetWidth(innerWidth)
+			m.jsonPane.SetHeight(vpHeight)
 			m.jsonPane.SetContent(m.jsonContent)
 
 			m.imagePane = viewport.New()
-			m.imagePane.SetWidth(halfWidth)
-			m.imagePane.SetHeight(contentHeight)
-			if m.hasImage {
-				m.imagePane.SetContent(renderPreview(m.img, halfWidth-2, contentHeight))
-			} else {
-				m.imagePane.SetContent("\n  No image data found")
-			}
+			m.imagePane.SetWidth(innerWidth)
+			m.imagePane.SetHeight(vpHeight)
+			m.imagePane.SetContent(m.renderImageContent(innerWidth, vpHeight))
 
 			m.ready = true
 		} else {
-			m.jsonPane.SetWidth(halfWidth)
-			m.jsonPane.SetHeight(jsonHeight)
-			m.imagePane.SetWidth(halfWidth)
-			m.imagePane.SetHeight(contentHeight)
-			if m.hasImage {
-				m.imagePane.SetContent(renderPreview(m.img, halfWidth-2, contentHeight))
-			}
+			m.jsonPane.SetWidth(innerWidth)
+			m.jsonPane.SetHeight(vpHeight)
+			m.imagePane.SetWidth(innerWidth)
+			m.imagePane.SetHeight(vpHeight)
+			m.imagePane.SetContent(m.renderImageContent(innerWidth, vpHeight))
 		}
 
-		if m.mode == modeImage && m.hasImage {
-			m.hqImageCache = renderFullscreen(m.img, m.width, m.height)
+		if m.mode == modeImage && len(m.images) > 0 {
+			m.hdImageCache = renderFullscreen(m.images[m.imageIdx].img, m.width, m.height, m.gfx)
 		}
 	}
 
@@ -169,6 +149,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// refreshImagePane re-renders the image preview to match the current
+// terminal dimensions and selected image.
+func (m *model) refreshImagePane() {
+	innerWidth := m.width/2 - borderPadding - paneFrame
+	vpHeight := m.height - chromeHeight - filterHeight
+	m.imagePane.SetContent(m.renderImageContent(innerWidth, vpHeight))
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -183,7 +171,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.filterInput.Value() != "" {
 			m.filterInput.SetValue("")
-			m.jsonContent = applyFilter(m.rawJSON, "", m.data, m.imageFields)
+			m.jsonContent = formatJSON(m.data)
 			if m.ready {
 				m.jsonPane.SetContent(m.jsonContent)
 				m.jsonPane.GotoTop()
@@ -194,26 +182,36 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case "tab":
 		if m.mode == modeJSON {
-			m.activePane = (m.activePane + 1) % paneCount
+			m.activePane = 1 - m.activePane
 			return m, nil
 		}
 
 	case "ctrl+p":
-		if m.mode == modeJSON && m.hasImage {
+		if m.mode == modeJSON && len(m.images) > 0 {
 			m.mode = modeImage
-			m.hqImageCache = renderFullscreen(m.img, m.width, m.height)
+			m.hdImageCache = renderFullscreen(m.images[m.imageIdx].img, m.width, m.height, m.gfx)
 			return m, nil
 		}
 
 	case "up", "down", "pgup", "pgdown":
 		if m.ready && m.mode == modeJSON {
-			var cmd tea.Cmd
 			if m.activePane == 0 {
+				var cmd tea.Cmd
 				m.jsonPane, cmd = m.jsonPane.Update(msg)
-			} else {
-				m.imagePane, cmd = m.imagePane.Update(msg)
+				return m, cmd
 			}
-			return m, cmd
+			// Image pane: cycle through images.
+			if len(m.images) > 1 {
+				switch msg.String() {
+				case "up", "pgup":
+					m.imageIdx = (m.imageIdx - 1 + len(m.images)) % len(m.images)
+				default:
+					m.imageIdx = (m.imageIdx + 1) % len(m.images)
+				}
+				m.hdImageCache = ""
+				m.refreshImagePane()
+			}
+			return m, nil
 		}
 
 	default:
@@ -222,7 +220,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.filterInput, cmd = m.filterInput.Update(msg)
 			if m.filterInput.Value() != prev {
-				m.jsonContent = applyFilter(m.rawJSON, m.filterInput.Value(), m.data, m.imageFields)
+				m.jsonContent = applyFilter(m.filterInput.Value(), m.data)
 				if m.ready {
 					m.jsonPane.SetContent(m.jsonContent)
 					m.jsonPane.GotoTop()
@@ -233,71 +231,4 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("170")).
-			Padding(0, 1)
-
-	activeBorder = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("62")).
-			Padding(0, 1)
-
-	inactiveBorder = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1)
-
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
-
-	accentStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("62")).
-			Bold(true)
-)
-
-func (m model) View() tea.View {
-	if m.mode == modeImage {
-		v := tea.NewView("Press esc to return\n\n" + m.hqImageCache)
-		v.AltScreen = true
-		return v
-	}
-
-	if !m.ready {
-		return tea.NewView("Loading...")
-	}
-
-	title := titleStyle.Render(fmt.Sprintf("Glimpse — %s", m.filename))
-
-	halfWidth := m.width/2 - borderPadding
-	contentHeight := m.height - chromeHeight
-
-	leftStyle := inactiveBorder.Width(halfWidth).Height(contentHeight)
-	rightStyle := inactiveBorder.Width(halfWidth).Height(contentHeight)
-	if m.activePane == 0 {
-		leftStyle = activeBorder.Width(halfWidth).Height(contentHeight)
-	} else {
-		rightStyle = activeBorder.Width(halfWidth).Height(contentHeight)
-	}
-
-	filterView := strings.TrimRight(m.filterInput.View(), "\n")
-	leftInner := filterView + "\n" + m.jsonPane.View()
-	left := leftStyle.Render(leftInner)
-	right := rightStyle.Render(m.imagePane.View())
-
-	content := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-
-	imgHint := ""
-	if m.hasImage {
-		imgHint = accentStyle.Render(" • ctrl+p: HD image")
-	}
-	status := statusStyle.Render(
-		fmt.Sprintf("  esc: clear/quit • tab: switch pane • ↑↓: scroll%s", imgHint))
-
-	v := tea.NewView(lipgloss.JoinVertical(lipgloss.Left, title, content, status))
-	v.AltScreen = true
-	return v
 }
