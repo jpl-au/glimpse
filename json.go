@@ -129,7 +129,7 @@ func matchesValue(key string, value any, needle string) bool {
 
 // isBase64 reports whether s looks like valid standard base64. It performs
 // a fast, allocation-free character check rather than decoding the full
-// string — actual decoding happens later in decodeImage.
+// string - actual decoding happens later in decodeImage.
 func isBase64(s string) bool {
 	if len(s)%4 != 0 {
 		return false

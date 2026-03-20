@@ -202,9 +202,9 @@ func renderFullscreen(img image.Image, termCols, termRows int, gfx graphics) str
 		}
 	}
 
-	// No HD graphics protocol available — revert to basic half-block
+	// No HD graphics protocol available - revert to basic half-block
 	// rendering with a notice so the user understands the degradation.
-	notice := "  No HD graphics protocol detected — reverted to basic rendering\n" +
+	notice := "  No HD graphics protocol detected - reverted to basic rendering\n" +
 		"  (install Kitty, Ghostty, WezTerm, iTerm2, or foot for HD)\n\n"
 	return notice + renderPreview(resized, termCols, termRows-3)
 }

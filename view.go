@@ -43,7 +43,7 @@ func (m model) View() tea.View {
 		return tea.NewView("Loading...")
 	}
 
-	title := titleStyle.Render(fmt.Sprintf("Glimpse — %s", m.filename))
+	title := titleStyle.Render(fmt.Sprintf("Glimpse - %s", m.filename))
 
 	halfWidth := m.width/2 - borderPadding
 	contentHeight := m.height - chromeHeight
